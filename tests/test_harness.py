@@ -290,7 +290,7 @@ class TestOpenCodeHarness:
         env = OpenCodeHarness().build_otel_exec_env(otel_port=4318)
         assert "--env" in env
         assert "OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318" in env
-        assert "OTEL_EXPORTER_OTLP_PROTOCOL=http/json" in env
+        assert "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in env
         assert "OTEL_BSP_SCHEDULE_DELAY=0" in env
 
     def test_build_otel_exec_env_none_port(self):
@@ -397,7 +397,7 @@ class TestOpenCodeHarness:
         harness = OpenCodeHarness()
         lines = harness.build_env_script_lines(otel_port=4318)
         assert any("OTEL_EXPORTER_OTLP_ENDPOINT=" in line for line in lines)
-        assert any("OTEL_EXPORTER_OTLP_PROTOCOL=http/json" in line for line in lines)
+        assert any("OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in line for line in lines)
         assert any("OTEL_BSP_SCHEDULE_DELAY=0" in line for line in lines)
 
     def test_write_sandbox_config_otel_enabled(self, tmp_path):

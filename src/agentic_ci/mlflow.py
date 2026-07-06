@@ -173,7 +173,7 @@ def _cost_by_session(metric_records):
     """
     totals = {}
     for rec in metric_records:
-        payload = rec.get("payload") or {}
+        payload = rec.get("payload", rec) if "payload" in rec else rec
         for rm in payload.get("resourceMetrics", []):
             for sm in rm.get("scopeMetrics", []):
                 for metric in sm.get("metrics", []):
@@ -246,7 +246,7 @@ def _query_source_by_request(log_records):
     """Map request_id -> query_source from the /v1/logs api_request events."""
     mapping = {}
     for rec in log_records:
-        payload = rec.get("payload") or {}
+        payload = rec.get("payload", rec) if "payload" in rec else rec
         for rl in payload.get("resourceLogs", []):
             for sl in rl.get("scopeLogs", []):
                 for lr in sl.get("logRecords", []):
@@ -339,11 +339,11 @@ def push_traces(log_file, endpoint, experiment, token=None):
                 except json.JSONDecodeError:
                     continue
                 path = rec.get("path", "")
-                if "/v1/traces" in path:
+                if "/v1/traces" in path or "resourceSpans" in rec:
                     trace_records.append(rec)
-                elif "/v1/metrics" in path:
+                elif "/v1/metrics" in path or "resourceMetrics" in rec:
                     metric_records.append(rec)
-                elif "/v1/logs" in path:
+                elif "/v1/logs" in path or "resourceLogs" in rec:
                     log_records.append(rec)
     except FileNotFoundError:
         return 0, 0
@@ -359,7 +359,7 @@ def push_traces(log_file, endpoint, experiment, token=None):
         )
         return 0, 0
 
-    payloads = [rec["payload"] for rec in trace_records if rec.get("payload")]
+    payloads = [rec.get("payload", rec) if "payload" in rec else rec for rec in trace_records]
     # Annotate spans (from the metrics/logs streams) before serialization.
     _add_span_costs(payloads, _cost_by_session(metric_records))
     _add_query_source(payloads, _query_source_by_request(log_records))

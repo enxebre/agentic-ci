@@ -208,7 +208,7 @@ class ClaudeCodeHarness(Harness):
                     "export OTEL_METRICS_EXPORTER=otlp",
                     "export OTEL_LOGS_EXPORTER=otlp",
                     "export OTEL_TRACES_EXPORTER=otlp",
-                    "export OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
+                    "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
                     f"export OTEL_EXPORTER_OTLP_ENDPOINT=http://{_OPENSHELL_GATEWAY_HOST}:{otel_port}",
                     "export OTEL_METRIC_EXPORT_INTERVAL=10000",
                     "export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1",
@@ -232,7 +232,7 @@ class ClaudeCodeHarness(Harness):
             "--env",
             "OTEL_TRACES_EXPORTER=otlp",
             "--env",
-            "OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
+            "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
             "--env",
             f"OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:{otel_port}",
             "--env",
@@ -394,7 +394,7 @@ class OpenCodeHarness(Harness):
             lines.extend(
                 [
                     f"export OTEL_EXPORTER_OTLP_ENDPOINT=http://{_OPENSHELL_GATEWAY_HOST}:{otel_port}",
-                    "export OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
+                    "export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
                     "export OTEL_BSP_SCHEDULE_DELAY=0",
                 ]
             )
@@ -411,7 +411,7 @@ class OpenCodeHarness(Harness):
             "--env",
             f"OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:{otel_port}",
             "--env",
-            "OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
+            "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
             "--env",
             # Flush spans immediately — OpenCode's process.exit() kills the
             # Node.js process before the batch processor can drain its queue.

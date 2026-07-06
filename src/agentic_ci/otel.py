@@ -1,14 +1,21 @@
-"""OTLP HTTP/JSON receiver and token/cost summary.
+"""OTLP collector lifecycle and post-hoc metrics parsing.
 
-Lightweight collector that accepts OTLP exports for metrics and logs,
-tracks token usage over a sliding window, and prints a summary.
+Manages an OpenTelemetry Collector (otelcol-contrib) subprocess that receives
+OTLP exports from Claude Code, writes them to a JSONL file, and provides
+post-hoc parsing for token/cost summaries.
+
+Falls back to a lightweight built-in Python HTTP collector when otelcol-contrib
+is not installed.
 """
 
 import json
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
+import textwrap
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -17,21 +24,191 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 _token_samples: list[tuple[float, int]] = []
 _WINDOW_SECS = 60
 
-
 MAX_BODY_SIZE = 1_048_576
 
 
-class OTLPHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
+# ---------------------------------------------------------------------------
+# Signal-type detection for OTLP JSONL records
+# ---------------------------------------------------------------------------
+
+def _signal_type(rec):
+    """Return 'metrics', 'logs', or 'traces' for a JSONL record.
+
+    Supports both the legacy {ts, path, payload} wrapper format and raw
+    OTLP JSON where each line is {resourceMetrics: ...} etc.
+    """
+    path = rec.get("path", "")
+    if path:
+        if "/v1/metrics" in path:
+            return "metrics"
+        if "/v1/logs" in path:
+            return "logs"
+        if "/v1/traces" in path:
+            return "traces"
+        return ""
+
+    if "resourceMetrics" in rec:
+        return "metrics"
+    if "resourceLogs" in rec:
+        return "logs"
+    if "resourceSpans" in rec:
+        return "traces"
+    return ""
+
+
+def _payload(rec):
+    """Extract the OTLP payload from a record (legacy wrapper or raw)."""
+    if "payload" in rec:
+        return rec["payload"]
+    return rec
+
+
+# ---------------------------------------------------------------------------
+# otelcol-contrib collector
+# ---------------------------------------------------------------------------
+
+def _find_free_port(bind_addr="127.0.0.1"):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((bind_addr, 0))
+        return s.getsockname()[1]
+
+
+def _write_config(run_dir, http_port, grpc_port, otel_log, bind_addr="127.0.0.1"):
+    config_path = os.path.join(run_dir, "otelcol.yaml")
+    config = textwrap.dedent(f"""\
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: "{bind_addr}:{http_port}"
+              grpc:
+                endpoint: "{bind_addr}:{grpc_port}"
+
+        processors:
+          batch:
+            timeout: 2s
+            send_batch_size: 256
+
+        exporters:
+          file:
+            path: "{otel_log}"
+            append: true
+
+        service:
+          telemetry:
+            logs:
+              level: warn
+          pipelines:
+            traces:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [file]
+            metrics:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [file]
+            logs:
+              receivers: [otlp]
+              processors: [batch]
+              exporters: [file]
+    """)
+    with open(config_path, "w") as f:
+        f.write(config)
+    return config_path
+
+
+def _start_otelcol(run_dir, bind_addr="127.0.0.1"):
+    os.makedirs(run_dir, exist_ok=True)
+    otel_log = os.path.join(run_dir, "claude-otel.jsonl")
+    otel_rate = os.path.join(run_dir, "claude-otel-rate.json")
+
+    for f in [otel_log]:
         try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            self.send_error(400, "Invalid Content-Length")
-            return
-        if length > MAX_BODY_SIZE:
-            self.send_error(413, "Payload Too Large")
-            return
-        body = self.rfile.read(length) if length else b""
+            os.unlink(f)
+        except FileNotFoundError:
+            pass
+
+    http_port = _find_free_port(bind_addr)
+    grpc_port = _find_free_port(bind_addr)
+    config_path = _write_config(run_dir, http_port, grpc_port, otel_log, bind_addr)
+
+    otelcol = shutil.which("otelcol-contrib")
+    if not otelcol:
+        raise FileNotFoundError("otelcol-contrib not found in PATH")
+
+    proc = subprocess.Popen(
+        [otelcol, "--config", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait for the HTTP endpoint to accept connections
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((bind_addr, http_port), timeout=0.5):
+                break
+        except (ConnectionRefusedError, OSError):
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"otelcol-contrib exited with code {proc.returncode}"
+                )
+            time.sleep(0.2)
+    else:
+        proc.kill()
+        raise RuntimeError("otelcol-contrib did not start within 10 seconds")
+
+    return proc, http_port, otel_log, otel_rate
+
+
+# ---------------------------------------------------------------------------
+# Legacy built-in Python collector (fallback)
+# ---------------------------------------------------------------------------
+
+class _LegacyOTLPHandler(BaseHTTPRequestHandler):
+    def _read_chunked(self):
+        chunks = []
+        total = 0
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                break
+            try:
+                chunk_size = int(line.split(b";")[0].strip(), 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                while True:
+                    trailer = self.rfile.readline()
+                    if not trailer or trailer in (b"\r\n", b"\n"):
+                        break
+                break
+            if chunk_size > MAX_BODY_SIZE:
+                return None
+            chunk = self.rfile.read(chunk_size)
+            self.rfile.readline()
+            total += len(chunk)
+            if total > MAX_BODY_SIZE:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def do_POST(self):
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            body = self._read_chunked()
+            if body is None:
+                self.send_error(413, "Payload Too Large")
+                return
+        else:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length > MAX_BODY_SIZE:
+                self.send_error(413, "Payload Too Large")
+                return
+            body = self.rfile.read(length) if length else b""
         try:
             payload = json.loads(body) if body else {}
         except json.JSONDecodeError:
@@ -90,8 +267,7 @@ def _update_token_rate(payload):
     os.replace(tmp, rate_file)
 
 
-def start_collector(run_dir, bind_addr="127.0.0.1"):
-    """Start the OTEL collector as a subprocess. Returns (proc, port)."""
+def _start_legacy(run_dir, bind_addr="127.0.0.1"):
     otel_log = os.path.join(run_dir, "claude-otel.jsonl")
     otel_rate = os.path.join(run_dir, "claude-otel-rate.json")
     port_file = os.path.join(run_dir, "otel-port")
@@ -122,12 +298,23 @@ def start_collector(run_dir, bind_addr="127.0.0.1"):
         time.sleep(0.1)
     else:
         proc.kill()
-        raise RuntimeError("OTEL collector did not write port file")
+        raise RuntimeError("Legacy OTEL collector did not write port file")
 
     with open(port_file) as f:
         port = int(f.read().strip())
 
     return proc, port, otel_log, otel_rate
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def start_collector(run_dir, bind_addr="127.0.0.1"):
+    """Start an OTEL collector. Prefers otelcol-contrib, falls back to built-in."""
+    if shutil.which("otelcol-contrib"):
+        return _start_otelcol(run_dir, bind_addr)
+    return _start_legacy(run_dir, bind_addr)
 
 
 def stop_collector(proc):
@@ -141,17 +328,20 @@ def stop_collector(proc):
 
 
 def parse_metrics(records):
-    """Parse OTLP JSONL records into structured token/cost data."""
+    """Parse OTLP JSONL records into structured token/cost data.
+
+    Supports both legacy {ts, path, payload} wrapper format and raw OTLP JSON.
+    """
     token_totals = defaultdict(float)
     cost_totals = defaultdict(float)
     api_requests = []
     active_time = defaultdict(float)
 
     for rec in records:
-        path = rec.get("path", "")
-        payload = rec.get("payload", {})
+        sig = _signal_type(rec)
+        payload = _payload(rec)
 
-        if "/v1/metrics" in path:
+        if sig == "metrics":
             for rm in payload.get("resourceMetrics", []):
                 for sm in rm.get("scopeMetrics", []):
                     for metric in sm.get("metrics", []):
@@ -165,7 +355,8 @@ def parse_metrics(records):
                                 )
                                 for a in dp.get("attributes", [])
                             }
-                            value = dp.get("asDouble", dp.get("asInt", 0))
+                            raw = dp.get("asDouble", dp.get("asInt", 0))
+                            value = float(raw) if isinstance(raw, str) else raw
 
                             if name == "claude_code.token.usage":
                                 model = attrs.get("model", "unknown")
@@ -178,7 +369,7 @@ def parse_metrics(records):
                                 time_type = attrs.get("type", "unknown")
                                 active_time[time_type] += value
 
-        elif "/v1/logs" in path:
+        elif sig == "logs":
             for rl in payload.get("resourceLogs", []):
                 for sl in rl.get("scopeLogs", []):
                     for lr in sl.get("logRecords", []):
@@ -256,11 +447,15 @@ def print_summary(log_file):
             print(f"  Total API time: {total_duration / 1000:.1f}s")
 
 
+# ---------------------------------------------------------------------------
+# Legacy __main__ entry point (used by _start_legacy fallback)
+# ---------------------------------------------------------------------------
+
 def main():
-    """Run the OTEL collector server."""
+    """Run the legacy built-in OTEL collector server."""
     port = int(os.environ.get("OTEL_COLLECTOR_PORT", "4318"))
     bind_addr = os.environ.get("OTEL_BIND_ADDR", "127.0.0.1")
-    server = HTTPServer((bind_addr, port), OTLPHandler)
+    server = HTTPServer((bind_addr, port), _LegacyOTLPHandler)
     actual_port = server.server_address[1]
     port_file = os.environ.get("OTEL_PORT_FILE")
     if port_file:

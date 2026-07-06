@@ -310,15 +310,7 @@ class ClaudeCodeStreamProcessor:
                 if total - self._last_emitted_total >= 5_000 or self._last_emitted_total == 0:
                     now = time.monotonic()
                     rate = 0.0
-                    try:
-                        with open(
-                            os.environ.get("OTEL_RATE_FILE", "/tmp/claude-otel-rate.json")
-                        ) as rf:
-                            rd = json.load(rf)
-                        rate = rd.get("rate", 0)
-                    except Exception:
-                        pass
-                    if rate <= 0 and self._last_emitted_time > 0:
+                    if self._last_emitted_time > 0:
                         dt = now - self._last_emitted_time
                         dv = total - self._last_emitted_total
                         if dt > 0:
